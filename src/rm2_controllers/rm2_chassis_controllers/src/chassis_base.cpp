@@ -6,10 +6,15 @@
 #include <angles/angles/angles.h>
 #include <rm2_common/robot_state_manager.h>
 
+#include <chrono>
+
 namespace rm2_chassis_controllers
 {
 controller_interface::CallbackReturn ChassisBase::on_init()
 {
+  // getNode
+  // param declare on init
+  // param readding kept on configeration
   try
   {
     publish_rate_ = get_node()->declare_parameter<double>("publish_rate", 100.0);
@@ -153,6 +158,8 @@ controller_interface::CallbackReturn ChassisBase::on_deactivate(const rclcpp_lif
 
 controller_interface::return_type ChassisBase::update(const rclcpp::Time& time, const rclcpp::Duration& period)
 {
+  auto start_time = std::chrono::high_resolution_clock::now();
+
   if (!last_publish_time_initialized_)
   {
     last_publish_time_ = time;
@@ -230,6 +237,33 @@ controller_interface::return_type ChassisBase::update(const rclcpp::Time& time, 
   moveJoint(time, period);
   powerLimit();
 
+  auto end_time = std::chrono::high_resolution_clock::now();
+  uint64_t execution_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+  
+  static auto last_print_time = std::chrono::high_resolution_clock::now();
+  static uint64_t total_execution_time = 0;
+  static uint32_t execution_count = 0;
+  static uint64_t max_execution_time = 0;
+
+  total_execution_time += execution_time;
+  execution_count++;
+  if (execution_time > max_execution_time)
+  {
+    max_execution_time = execution_time;
+  }
+
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - last_print_time).count();
+  if (elapsed >= 1000)
+  {
+    RCLCPP_INFO(get_node()->get_logger(), "[Chassis] Real-Time Stats (1s): Freq = %u Hz, Avg Time = %lu us, Max Time = %lu us",
+                execution_count, total_execution_time / execution_count, max_execution_time);
+    
+    execution_count = 0;
+    total_execution_time = 0;
+    max_execution_time = 0;
+    last_print_time = end_time;
+  }
+
   return controller_interface::return_type::OK;
 }
 
@@ -269,7 +303,7 @@ void ChassisBase::follow(const rclcpp::Time& /*time*/, const rclcpp::Duration& p
   }
   catch (tf2::TransformException& ex)
   {
-    RCLCPP_WARN(get_node()->get_logger(), "%s", ex.what());
+    // RCLCPP_WARN(get_node()->get_logger(), "%s", ex.what());
   }
 }
 
@@ -309,7 +343,7 @@ void ChassisBase::twist(const rclcpp::Time& time, const rclcpp::Duration& period
   }
   catch (tf2::TransformException& ex)
   {
-    RCLCPP_WARN(get_node()->get_logger(), "%s", ex.what());
+    //RCLCPP_WARN(get_node()->get_logger(), "%s", ex.what());
   }
 }
 
@@ -339,7 +373,7 @@ void ChassisBase::updateOdom(const rclcpp::Time& time, const rclcpp::Duration& p
       }
       catch (...)
       {
-        RCLCPP_WARN(get_node()->get_logger(), "Failed to init robot_odom2lidar_odom.");
+        //RCLCPP_WARN(get_node()->get_logger(), "Failed to init robot_odom2lidar_odom.");
       }
     }
 
@@ -403,65 +437,68 @@ void ChassisBase::updateOdom(const rclcpp::Time& time, const rclcpp::Duration& p
       }
       catch (...)
       {
-        RCLCPP_WARN(get_node()->get_logger(), "Failed to update global_map2robot_odom.");
+        //RCLCPP_WARN(get_node()->get_logger(), "Failed to update global_map2robot_odom.");
       }
     }
     global_map2robot_odom_.header.stamp = time;
     global_map2camera_init_.header.stamp = time;
   }
 
-  if (publish_odom_tf_)
+  geometry_msgs::msg::Twist vel_base = odometry();  // on base_link frame
+  geometry_msgs::msg::Vector3 linear_vel_odom, angular_vel_odom;
+
+  try
   {
-    try
+    robot_odom2robot_base_ =
+      robot_state_handle_.lookupTransform(robot_odom_frame_id_, robot_base_frame_id_, rclcpp::Time(0));
+    tf2::Quaternion q;
+    tf2::fromMsg(robot_odom2robot_base_.transform.rotation, q);
+    tf2::Matrix3x3(q).getEulerYPR(yaw_, pitch_, roll_);
+  }
+  catch (tf2::TransformException& ex)
+  {
+    if (publish_odom_tf_)
     {
-      robot_odom2robot_base_ =
-        robot_state_handle_.lookupTransform(robot_odom_frame_id_, robot_base_frame_id_, rclcpp::Time(0));
-      robot_odom2robot_base_.header.stamp = time;
-      geometry_msgs::msg::Twist vel_base = odometry();  // on base_link frame
-      geometry_msgs::msg::Vector3 linear_vel_odom, angular_vel_odom;
-      tf2::doTransform(vel_base.linear, linear_vel_odom, robot_odom2robot_base_);
-      tf2::doTransform(vel_base.angular, angular_vel_odom, robot_odom2robot_base_);
-
-      double length =
-        std::sqrt(std::pow(linear_vel_odom.x, 2) + std::pow(linear_vel_odom.y, 2) + std::pow(linear_vel_odom.z, 2));
-      if (length < max_odom_vel_)
-      {
-        // avoid nan vel
-        robot_odom2robot_base_.transform.translation.x += linear_vel_odom.x * period.seconds();
-        robot_odom2robot_base_.transform.translation.y += linear_vel_odom.y * period.seconds();
-        robot_odom2robot_base_.transform.translation.z += linear_vel_odom.z * period.seconds();
-      }
-      length = std::sqrt(std::pow(angular_vel_odom.x, 2) + std::pow(angular_vel_odom.y, 2) + std::pow(angular_vel_odom.z, 2));
-
-      if (length > 0.001)
-      {
-        // avoid nan quat
-        tf2::Quaternion odom2base_quat, trans_quat;
-        tf2::fromMsg(robot_odom2robot_base_.transform.rotation, odom2base_quat);
-        trans_quat.setRotation(tf2::Vector3(angular_vel_odom.x / length,
-                                                angular_vel_odom.y / length,
-                                                angular_vel_odom.z / length),
-                                             length * period.seconds());
-        odom2base_quat = trans_quat * odom2base_quat;
-        odom2base_quat.normalize();
-        robot_odom2robot_base_.transform.rotation = tf2::toMsg(odom2base_quat);
-      }
-
-      // The place of this code should make sure
-      tf2::Quaternion q;
-      tf2::fromMsg(robot_odom2robot_base_.transform.rotation, q);
-      tf2::Matrix3x3(q).getEulerYPR(yaw_, pitch_, roll_);
-
-      // It has a return value of bool, which is different from ros1
-      if (!robot_state_handle_.setTransform(robot_odom2robot_base_, "rm2_chassis_controllers"))
-      {
-        RCLCPP_WARN(get_node()->get_logger(), "Failed to set transform.");
-      }
+      brcst4robot_odom2robot_base_.sendTransform(robot_odom2robot_base_);  // For some reason, the sendTransform in init sometime not work
     }
-    catch (...)
-    {
-      RCLCPP_WARN(get_node()->get_logger(), "Failed to update robot_odom2robot_base.");
-    }
+    RCLCPP_WARN(get_node()->get_logger(), "%s", ex.what());
+    return;
+  }
+
+  robot_odom2robot_base_.header.stamp = time;
+
+  // integral vel to pos and angle
+  tf2::doTransform(vel_base.linear, linear_vel_odom, robot_odom2robot_base_);
+  tf2::doTransform(vel_base.angular, angular_vel_odom, robot_odom2robot_base_);
+
+  double length =
+    std::sqrt(std::pow(linear_vel_odom.x, 2) + std::pow(linear_vel_odom.y, 2) + std::pow(linear_vel_odom.z, 2));
+  if (length < max_odom_vel_)
+  {
+    // avoid nan vel
+    robot_odom2robot_base_.transform.translation.x += linear_vel_odom.x * period.seconds();
+    robot_odom2robot_base_.transform.translation.y += linear_vel_odom.y * period.seconds();
+    robot_odom2robot_base_.transform.translation.z += linear_vel_odom.z * period.seconds();
+  }
+  
+  length = std::sqrt(std::pow(angular_vel_odom.x, 2) + std::pow(angular_vel_odom.y, 2) + std::pow(angular_vel_odom.z, 2));
+  if (length > 0.001)
+  {
+    // avoid nan quat
+    tf2::Quaternion odom2base_quat, trans_quat;
+    tf2::fromMsg(robot_odom2robot_base_.transform.rotation, odom2base_quat);
+    trans_quat.setRotation(tf2::Vector3(angular_vel_odom.x / length,
+                                            angular_vel_odom.y / length,
+                                            angular_vel_odom.z / length),
+                                         length * period.seconds());
+    odom2base_quat = trans_quat * odom2base_quat;
+    odom2base_quat.normalize();
+    robot_odom2robot_base_.transform.rotation = tf2::toMsg(odom2base_quat);
+  }
+
+  if (!robot_state_handle_.setTransform(robot_odom2robot_base_, "rm2_chassis_controllers"))
+  {
+    //RCLCPP_WARN(get_node()->get_logger(), "Failed to set transform.");
   }
 
   if (publish_rate_ > 0.0 && last_publish_time_ + rclcpp::Duration::from_seconds(1.0 / publish_rate_) < time)
@@ -496,24 +533,21 @@ void ChassisBase::tfVelToBase(const std::string& from)
   }
   catch (tf2::TransformException& ex)
   {
-    RCLCPP_WARN(get_node()->get_logger() ,"%s", ex.what());
+    //RCLCPP_WARN(get_node()->get_logger() ,"%s", ex.what());
   }
 }
 
 void ChassisBase::powerLimit()
 {
-  if (power_limit_joints_ == nullptr)
-  {
-    return;
-  }
+  if (!power_limit_joints_) return;
   double power_limit = cmd_rt_buffer_.readFromRT()->cmd_chassis.power_limit;
   // Three coefficients of a quadratic equation in one variable
   double a = 0., b = 0., c = 0.;
   // Whether we must use get_optional()?
-  for (size_t i = 0; i < power_limit_joints_->joint_names.size(); ++i)
+  for (const auto& joint : *power_limit_joints_)
   {
-    double cmd_effort = command_interfaces_[power_limit_joints_->cmd_index[i]].get_optional<double>().value();
-    double real_vel = state_interfaces_[power_limit_joints_->vel_index[i]].get_optional<double>().value();
+    double cmd_effort = joint.getCommand();
+    double real_vel = joint.getVelocity();
     a += square(cmd_effort);
     b += std::abs(cmd_effort * real_vel);
     c += square(real_vel);
@@ -523,28 +557,29 @@ void ChassisBase::powerLimit()
   // Root formula for quadratic equation in one variable
   double zoom_coeff = (square(b) - 4 * a * c) > 0 ? ((-b + sqrt(square(b) - 4 * a * c)) / (2 * a)) : 0.;
 
-  for (size_t i = 0; i < power_limit_joints_->joint_names.size(); ++i)
+  for (auto& joint : *power_limit_joints_)
   {
     if (pitch_ < pitch_angle_threshold_ && enable_uphill_acceleration_)
     {
-      if (power_limit_joints_->joint_names[i].find("back") != std::string::npos)
+
+      if (joint.getName().find("back") != std::string::npos)
       {
-        (void)command_interfaces_[power_limit_joints_->cmd_index[i]].set_value(zoom_coeff > 1 ?
-          command_interfaces_[power_limit_joints_->cmd_index[i]].get_optional<double>().value() :
-          command_interfaces_[power_limit_joints_->cmd_index[i]].get_optional<double>().value() * zoom_coeff * scale_);
+        (void)joint.setCommand(zoom_coeff > 1 ?
+          joint.getCommand() :
+          joint.getCommand() * zoom_coeff * scale_);
       }
-      if (power_limit_joints_->joint_names[i].find("front") != std::string::npos)
+      if (joint.getName().find("front") != std::string::npos)
       {
-        (void)command_interfaces_[power_limit_joints_->cmd_index[i]].set_value(zoom_coeff > 1 ?
-          command_interfaces_[power_limit_joints_->cmd_index[i]].get_optional<double>().value() :
-          command_interfaces_[power_limit_joints_->cmd_index[i]].get_optional<double>().value() * zoom_coeff);
+        (void)joint.setCommand(zoom_coeff > 1 ?
+          joint.getCommand() :
+          joint.getCommand() * zoom_coeff * scale_);
       }
     }
     else
     {
-      (void)command_interfaces_[power_limit_joints_->cmd_index[i]].set_value(zoom_coeff > 1 ?
-        command_interfaces_[power_limit_joints_->cmd_index[i]].get_optional<double>().value() :
-        command_interfaces_[power_limit_joints_->cmd_index[i]].get_optional<double>().value() * zoom_coeff);
+      (void)joint.setCommand(zoom_coeff > 1 ?
+        joint.getCommand() :
+        joint.getCommand() * zoom_coeff * scale_);
     }
   }
 }

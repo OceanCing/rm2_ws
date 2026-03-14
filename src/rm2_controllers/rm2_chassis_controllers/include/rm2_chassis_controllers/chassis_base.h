@@ -22,6 +22,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <control_toolbox/pid_ros.hpp>
 #include <unordered_map>
+#include "rm2_common/joint_manager.h"
 
 namespace rm2_chassis_controllers
 {
@@ -37,6 +38,7 @@ protected:
     int64_t stamp_ns;
   };
 
+  // This struct has been deprecated
   struct JointGroup
   {
     std::vector<std::string> joint_names;
@@ -59,6 +61,7 @@ protected:
       cmd_index.reserve(n);
       pos_index.reserve(n);
       vel_index.reserve(n);
+
       eff_index.reserve(n);
     }
   };
@@ -78,6 +81,7 @@ public:
 
   controller_interface::return_type update(const rclcpp::Time& time, const rclcpp::Duration& period) override;
 protected:
+  // this method has been deprecated
   template<typename T>
   std::unordered_map<std::string, size_t> buildInterfaceIndexMap(T&& interfaces) {
     std::unordered_map<std::string, size_t> interface_index_map;
@@ -87,7 +91,8 @@ protected:
     }
     return interface_index_map;
   }
-
+  
+  // this method has been deprecated
   void buildJointsIndex(JointGroup& joints,const std::unordered_map<std::string, size_t>& command_map,
     const std::unordered_map<std::string, size_t>& state_map)
   {
@@ -156,7 +161,7 @@ protected:
   // JointGroup knee_joints_;  // If the Legged chassis
   // JointGroup hip_joints_;   // If the Legged chassis
 
-  JointGroup* power_limit_joints_{ nullptr };
+  joint_manager::JointManager* power_limit_joints_{ nullptr };
   realtime_tools::RealtimeBuffer<Command> cmd_rt_buffer_;
   realtime_tools::RealtimeBuffer<nav_msgs::msg::Odometry> slam_rt_buffer_;
   realtime_tools::RealtimeBuffer<geometry_msgs::msg::TransformStamped> localization_rt_buffer_;

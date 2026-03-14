@@ -17,13 +17,14 @@ hardware_interface::CallbackReturn OmniController::on_init()
   }
   try
   {
-    wheel_joints_.joint_names = get_node()->declare_parameter<std::vector<std::string>>("joint_names.wheels", std::vector<std::string>{});
-    power_limit_joints_ = &wheel_joints_;
-    if (wheel_joints_.joint_names.empty())
+    auto joint_names = get_node()->declare_parameter<std::vector<std::string>>("joint_names.wheels", std::vector<std::string>{});
+    if (joint_names.empty())
     {
-      RCLCPP_ERROR(get_node()->get_logger(), "No joint given (namespace: %s)", get_node()->get_name());
+      RCLCPP_ERROR(get_node()->get_logger(), "No wheel joint given (namespace: %s)", get_node()->get_name());
       return CallbackReturn::ERROR;
     }
+    joint_manager_.init(joint_names);
+    power_limit_joints_ = &joint_manager_;
     K = get_node()->declare_parameter<double>("K", 1.0);
   }
   catch (std::exception& ex)
@@ -41,25 +42,34 @@ hardware_interface::CallbackReturn OmniController::on_configure(const rclcpp_lif
     return CallbackReturn::ERROR;
   }
 
-  buildJointsPids(wheel_joints_);
+  auto joint_names = joint_manager_.get_names();
 
-  chassis2joints_.resize(wheel_joints_.joint_names.size(), 3);
-  for (size_t i = 0; i < wheel_joints_.joint_names.size(); ++i)
+  pids_.clear();
+  pids_.reserve(joint_names.size());
+  for (const auto& name : joint_names)
+  {
+    auto pid = std::make_shared<control_toolbox::PidROS>(get_node(), name + ".pid", "~/" + name, false);
+    pid->initialize_from_ros_parameters();
+    pids_.push_back(pid);
+  }
+
+  chassis2joints_.resize(joint_names.size(), 3);
+  for (size_t i = 0; i < joint_names.size(); ++i)
   {
     std::vector<double> pose;
     double roller_angle;
     double radius;
     try
     {
-      pose = get_node()->declare_parameter<std::vector<double>>(wheel_joints_.joint_names[i] + ".pose", std::vector<double>{});
+      pose = get_node()->declare_parameter<std::vector<double>>(joint_names[i] + ".pose", std::vector<double>{});
       if (pose.size() != 3)
       {
         RCLCPP_ERROR(get_node()->get_logger(), "Build matrix 'chassis2joints_' failed: pose's size is %lu", pose.size());
         return CallbackReturn::ERROR;
       }
 
-      roller_angle = get_node()->declare_parameter<double>(wheel_joints_.joint_names[i] + ".roller_angle", 0.);
-      radius = get_node()->declare_parameter<double>(wheel_joints_.joint_names[i] + ".radius", 0.07625);
+      roller_angle = get_node()->declare_parameter<double>(joint_names[i] + ".roller_angle", 0.);
+      radius = get_node()->declare_parameter<double>(joint_names[i] + ".radius", 0.07625);
     }
     catch (std::exception& ex)
     {
@@ -87,22 +97,18 @@ controller_interface::CallbackReturn OmniController::on_activate(const rclcpp_li
     return CallbackReturn::ERROR;
   }
 
-  auto command_interface_index_map = buildInterfaceIndexMap(command_interfaces_);
-  auto state_interface_index_map = buildInterfaceIndexMap(state_interfaces_);
-  wheel_joints_.reset();
-  wheel_joints_.reserve(wheel_joints_.joint_names.size());
-  buildJointsIndex(wheel_joints_, command_interface_index_map, state_interface_index_map);
+  joint_manager_.bind_all(state_interfaces_, command_interfaces_);
 
   return CallbackReturn::SUCCESS;
 }
 
+// is it neccessary to un config joint manager while on deactivate?
 controller_interface::CallbackReturn OmniController::on_deactivate(const rclcpp_lifecycle::State& previous_state)
 {
   if (ChassisBase::on_deactivate(previous_state) != CallbackReturn::SUCCESS)
   {
     return CallbackReturn::ERROR;
   }
-  wheel_joints_.reset();
 
   return CallbackReturn::SUCCESS;
 }
@@ -111,12 +117,7 @@ controller_interface::InterfaceConfiguration OmniController::command_interface_c
 {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
-
-  for (const std::string& joint_name : wheel_joints_.joint_names)
-  {
-    config.names.push_back(joint_name + "/" + hardware_interface::HW_IF_EFFORT);
-  }
-
+  config.names = joint_manager_.get_command_interface_names();
   return config;
 }
 
@@ -124,19 +125,13 @@ controller_interface::InterfaceConfiguration OmniController::state_interface_con
 {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
-
-  for (const std::string& joint_name : wheel_joints_.joint_names)
-  {
-    config.names.push_back(joint_name + "/" + hardware_interface::HW_IF_POSITION);
-    config.names.push_back(joint_name + "/" + hardware_interface::HW_IF_VELOCITY);
-    config.names.push_back(joint_name + "/" + hardware_interface::HW_IF_EFFORT);
-  }
-
+  config.names = joint_manager_.get_state_interface_names();
   return config;
 }
 
 void OmniController::moveJoint(const rclcpp::Time& /*time*/, const rclcpp::Duration& period)
 {
+  joint_manager_.read_all();
   Eigen::Vector3d vel_chassis;
   if (state_ == RAW)
   {
@@ -148,19 +143,19 @@ void OmniController::moveJoint(const rclcpp::Time& /*time*/, const rclcpp::Durat
   vel_chassis << vel_cmd_.z, vel_cmd_.x, vel_cmd_.y;
   Eigen::VectorXd vel_joints = chassis2joints_ * vel_chassis;
 
-  for (size_t i = 0; i < wheel_joints_.joint_names.size(); ++i)
+  for (size_t i = 0; i < joint_manager_.size(); ++i)
   {
-    (void)command_interfaces_[wheel_joints_.cmd_index[i]].set_value(wheel_joints_.pids[i]->compute_command(
-      vel_joints[i] - state_interfaces_[wheel_joints_.vel_index[i]].get_optional<double>().value(), period));
+    double error = vel_joints[i] - joint_manager_[i].getVelocity();
+    joint_manager_[i].setCommand(pids_[i]->compute_command(error, period));
   }
 }
 
 geometry_msgs::msg::Twist OmniController::odometry()
 {
-  Eigen::VectorXd vel_joints(wheel_joints_.joint_names.size());
-  for (size_t i = 0; i < wheel_joints_.joint_names.size(); i++)
+  Eigen::VectorXd vel_joints(joint_manager_.size());
+  for (size_t i = 0; i < joint_manager_.size(); i++)
   {
-    vel_joints[i] = state_interfaces_[wheel_joints_.vel_index[i]].get_optional<double>().value();
+    vel_joints[i] = joint_manager_[i].getVelocity();
   }
   Eigen::Vector3d vel_chassis = chassis2joints_.completeOrthogonalDecomposition().solve(vel_joints);
   geometry_msgs::msg::Twist twist;

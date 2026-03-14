@@ -20,10 +20,12 @@ private:
     std::vector<Vec2<double>> position;
     std::vector<double> pivot_offset, pivot_buffer_threshold, pivot_effort_threshold, pivot_position_error_threshold,
       pivot_max_reduce_cnt, wheel_radius;
-    JointGroup wheel_joints;
-    JointGroup pivot_joints;
+    joint_manager::JointManager pivot_joints;
+    joint_manager::JointManager wheel_joints;
     size_t size;
   };
+  std::vector<std::shared_ptr<control_toolbox::PidROS>> pivot_pids_;
+  std::vector<std::shared_ptr<control_toolbox::PidROS>> wheel_pids_;
 public:
   SwerveController() = default;
   hardware_interface::CallbackReturn on_init() override;

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "rm2_chassis_controllers/chassis_base.h"
+#include <control_toolbox/pid_ros.hpp>
 
 namespace rm2_chassis_controllers
 {
@@ -18,12 +19,12 @@ public:
   controller_interface::CallbackReturn on_deactivate(const rclcpp_lifecycle::State& previous_state) override;
   controller_interface::InterfaceConfiguration command_interface_configuration() const override;
   controller_interface::InterfaceConfiguration state_interface_configuration() const override;
-
 private:
   void moveJoint(const rclcpp::Time& /*time*/, const rclcpp::Duration& period) override;
   geometry_msgs::msg::Twist odometry() override;
 
-  JointGroup wheel_joints_;
+  joint_manager::JointManager joint_manager_;
+  std::vector<std::shared_ptr<control_toolbox::PidROS>> pids_;
   double K = 0.;  // Feedforward gain
   Eigen::MatrixXd chassis2joints_;
 };
